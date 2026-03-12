@@ -6,13 +6,13 @@ Monitors listed price + instant card offers and sends Telegram alerts.
 import os
 import sys
 import json
-import requests
 import re
 import logging
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
+from curl_cffi import requests
 
 # ─────────────────────────────────────────────
 # CONFIG (all from GitHub Secrets / env vars)
@@ -121,14 +121,18 @@ def save_state(state):
 # ─────────────────────────────────────────────
 def fetch_page(url):
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
+        # Impersonate Chrome at TLS level — much harder for Flipkart to block
+        resp = requests.get(
+            url,
+            impersonate="chrome120",
+            timeout=20
+        )
         resp.raise_for_status()
         return resp.text
     except requests.exceptions.HTTPError as e:
         log.error(f"HTTP error fetching page: status {e.response.status_code}")
         return None
     except Exception as e:
-        # Log type only — URL from env var but being safe
         log.error(f"Failed to fetch page: {type(e).__name__}")
         return None
 
