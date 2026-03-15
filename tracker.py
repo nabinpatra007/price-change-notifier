@@ -57,9 +57,9 @@ def validate_config():
     except Exception:
         errors.append("FLIPKART_URL is not a valid URL.")
 
-    # Validate ScraperAPI key — should be a 32 char hex string
-    if not re.fullmatch(r'[a-f0-9]{32}', SCRAPER_API_KEY.strip()):
-        errors.append("SCRAPER_API_KEY format looks invalid (expected 32 char hex string).")
+    # Validate ScraperAPI key — just check it's not empty
+    if not SCRAPER_API_KEY or len(SCRAPER_API_KEY.strip()) < 10:
+        errors.append("SCRAPER_API_KEY looks invalid or too short.")
         for e in errors:
             log.error(f"Config error: {e}")
         sys.exit(1)
