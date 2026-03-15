@@ -2,7 +2,7 @@ name: PS5 Price Tracker
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # Every 5 minutes
+    - cron: "*/45 * * * *"  # Every 45 minutes (~32 calls/day, fits free tier)
   workflow_dispatch:         # Allow manual trigger from GitHub UI
 
 # Minimal permissions — write only needed to commit state.json
@@ -27,7 +27,7 @@ jobs:
           python-version: "3.11"
 
       - name: Cache pip dependencies
-        uses: actions/cache@v4  # v4.2.0
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c6158d  # v4.2.0
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
@@ -40,6 +40,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FLIPKART_URL: ${{ secrets.FLIPKART_URL }}
+          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
         run: python tracker.py
 
       - name: Commit state if changed
