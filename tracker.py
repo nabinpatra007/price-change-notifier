@@ -8,26 +8,29 @@ import sys
 import json
 import re
 import logging
+import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
-from curl_cffi import requests
 
 # ─────────────────────────────────────────────
 # CONFIG (all from GitHub Secrets / env vars)
 # ─────────────────────────────────────────────
-BOT_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID     = os.environ["TELEGRAM_CHAT_ID"]
-PRODUCT_URL = os.environ["FLIPKART_URL"]
-TARGET      = 44900   # Trigger if price OR effective price drops below this
-STATE_FILE  = "state.json"
-MAX_ALERTS  = 2
+BOT_TOKEN      = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID        = os.environ["TELEGRAM_CHAT_ID"]
+PRODUCT_URL    = os.environ["FLIPKART_URL"]
+SCRAPER_API_KEY = os.environ["SCRAPER_API_KEY"]
+TARGET         = 44900
+STATE_FILE     = "state.json"
+MAX_ALERTS     = 2
 REMINDER_MINUTES = 30
 
 # Price sanity bounds — guard against scraping glitches
 PRICE_MIN = 5_000
 PRICE_MAX = 2_00_000
+
+SCRAPER_API_URL = "https://api.scraperapi.com"
 
 # ─────────────────────────────────────────────
 # STARTUP VALIDATION
@@ -54,7 +57,9 @@ def validate_config():
     except Exception:
         errors.append("FLIPKART_URL is not a valid URL.")
 
-    if errors:
+    # Validate ScraperAPI key — should be a 32 char hex string
+    if not re.fullmatch(r'[a-f0-9]{32}', SCRAPER_API_KEY.strip()):
+        errors.append("SCRAPER_API_KEY format looks invalid (expected 32 char hex string).")
         for e in errors:
             log.error(f"Config error: {e}")
         sys.exit(1)
@@ -120,18 +125,25 @@ def save_state(state):
 # SCRAPING
 # ─────────────────────────────────────────────
 def fetch_page(url):
+    """Fetch Flipkart page via ScraperAPI — handles IP rotation automatically."""
     try:
-        # Impersonate Chrome at TLS level — much harder for Flipkart to block
+        payload = {
+            "api_key": SCRAPER_API_KEY,
+            "url": url,
+            "render": "false",      # No JS rendering needed — price is in HTML
+            "country_code": "in",   # Use Indian IP for correct pricing
+        }
         resp = requests.get(
-            url,
-            impersonate="chrome120",
-            timeout=20
+            SCRAPER_API_URL,
+            params=payload,
+            timeout=60              # ScraperAPI needs more time than direct requests
         )
-        resp.raise_for_status()
-        return resp.text
-    except requests.exceptions.HTTPError as e:
-        log.error(f"HTTP error fetching page: status {e.response.status_code}")
-        return None
+        if resp.status_code == 200:
+            log.info("Page fetched successfully via ScraperAPI.")
+            return resp.text
+        else:
+            log.error(f"ScraperAPI returned status {resp.status_code}")
+            return None
     except Exception as e:
         log.error(f"Failed to fetch page: {type(e).__name__}")
         return None
@@ -263,6 +275,7 @@ def send_telegram(message):
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
+        "disable_notification": False,  # Force notification even if chat is muted
     }
     try:
         r = requests.post(tg_url, json=payload, timeout=15)
