@@ -1,12 +1,16 @@
 """
 Flipkart PS5 Price Tracker Bot
 Monitors listed price + instant card offers and sends Telegram alerts.
+Two scenarios:
+  1. Listed price drops below TARGET
+  2. Effective price (after instant card offers) drops below TARGET
 """
 
 import os
 import sys
 import json
 import re
+import time
 import logging
 import requests
 from bs4 import BeautifulSoup
@@ -15,57 +19,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 # ─────────────────────────────────────────────
-# CONFIG (all from GitHub Secrets / env vars)
+# LOGGING
 # ─────────────────────────────────────────────
-BOT_TOKEN      = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID        = os.environ["TELEGRAM_CHAT_ID"]
-PRODUCT_URL    = os.environ["FLIPKART_URL"]
-SCRAPER_API_KEY = os.environ["SCRAPER_API_KEY"]
-TARGET         = 44900
-STATE_FILE     = "state.json"
-MAX_ALERTS     = 2
-REMINDER_MINUTES = 30
-
-# Price sanity bounds — guard against scraping glitches
-PRICE_MIN = 5_000
-PRICE_MAX = 2_00_000
-
-SCRAPER_API_URL = "https://api.scraperapi.com"
-
-# ─────────────────────────────────────────────
-# STARTUP VALIDATION
-# ─────────────────────────────────────────────
-def validate_config():
-    """Validate secrets and config at startup. Abort early if anything is wrong."""
-    errors = []
-
-    # Validate Telegram token format: digits:alphanumeric_string
-    if not re.fullmatch(r'\d+:[A-Za-z0-9_-]{35,}', BOT_TOKEN):
-        errors.append("TELEGRAM_BOT_TOKEN format looks invalid.")
-
-    # Validate Chat ID is numeric (can be negative for group chats)
-    if not re.fullmatch(r'-?\d+', CHAT_ID.strip()):
-        errors.append("TELEGRAM_CHAT_ID must be a numeric value.")
-
-    # Validate Flipkart URL — must be HTTPS and from flipkart.com only
-    try:
-        parsed = urlparse(PRODUCT_URL)
-        if parsed.scheme != "https":
-            errors.append("FLIPKART_URL must use HTTPS.")
-        if not (parsed.netloc == "www.flipkart.com" or parsed.netloc == "flipkart.com"):
-            errors.append("FLIPKART_URL must be from flipkart.com only.")
-    except Exception:
-        errors.append("FLIPKART_URL is not a valid URL.")
-
-    # Validate ScraperAPI key — just check it's not empty
-    if not SCRAPER_API_KEY or len(SCRAPER_API_KEY.strip()) < 10:
-        errors.append("SCRAPER_API_KEY looks invalid or too short.")
-        for e in errors:
-            log.error(f"Config error: {e}")
-        sys.exit(1)
-
-    log.info("Config validation passed.")
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -73,20 +28,52 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# HEADERS — rotated to avoid Flipkart blocks
+# CONFIG
 # ─────────────────────────────────────────────
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-IN,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Connection": "keep-alive",
-    "DNT": "1",
-}
+BOT_TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID          = os.environ.get("TELEGRAM_CHAT_ID", "")
+PRODUCT_URL      = os.environ.get("FLIPKART_URL", "")
+SCRAPER_API_KEY  = os.environ.get("SCRAPER_API_KEY", "")
+
+TARGET           = 44900
+STATE_FILE       = "state.json"
+REMINDER_MINUTES = 30
+PRICE_MIN        = 5_000
+PRICE_MAX        = 200_000
+
+SCRAPER_API_URL  = "https://api.scraperapi.com"
+
+
+# ─────────────────────────────────────────────
+# STARTUP VALIDATION
+# ─────────────────────────────────────────────
+def validate_config():
+    errors = []
+
+    if not re.fullmatch(r'\d+:[A-Za-z0-9_-]{35,}', BOT_TOKEN):
+        errors.append("TELEGRAM_BOT_TOKEN format looks invalid.")
+
+    if not re.fullmatch(r'-?\d+', CHAT_ID.strip()):
+        errors.append("TELEGRAM_CHAT_ID must be numeric.")
+
+    try:
+        parsed = urlparse(PRODUCT_URL)
+        if parsed.scheme != "https":
+            errors.append("FLIPKART_URL must use HTTPS.")
+        if "flipkart.com" not in parsed.netloc:
+            errors.append("FLIPKART_URL must be from flipkart.com.")
+    except Exception:
+        errors.append("FLIPKART_URL is not a valid URL.")
+
+    if len(SCRAPER_API_KEY.strip()) < 10:
+        errors.append("SCRAPER_API_KEY looks invalid or too short.")
+
+    if errors:
+        for e in errors:
+            log.error(f"Config error: {e}")
+        sys.exit(1)
+
+    log.info("Config validation passed.")
 
 
 # ─────────────────────────────────────────────
@@ -101,12 +88,11 @@ def load_state():
         try:
             with open(STATE_FILE) as f:
                 loaded = json.load(f)
-            # Validate structure — don't trust file blindly
             for key in ("scenario1", "scenario2"):
                 if key not in loaded:
                     raise ValueError(f"Missing key: {key}")
                 if "count" not in loaded[key] or "last_alert_ts" not in loaded[key]:
-                    raise ValueError(f"Malformed scenario state for {key}")
+                    raise ValueError(f"Malformed state for {key}")
                 if not isinstance(loaded[key]["count"], int):
                     raise ValueError(f"count must be int for {key}")
             return loaded
@@ -124,22 +110,17 @@ def save_state(state):
 # ─────────────────────────────────────────────
 # SCRAPING
 # ─────────────────────────────────────────────
-def fetch_page(url):
-    """Fetch Flipkart page via ScraperAPI — handles IP rotation automatically."""
+def fetch_page(url, render=False):
     try:
         payload = {
             "api_key": SCRAPER_API_KEY,
             "url": url,
-            "render": "false",      # No JS rendering needed — price is in HTML
-            "country_code": "in",   # Use Indian IP for correct pricing
+            "render": "true" if render else "false",
+            "country_code": "in",
         }
-        resp = requests.get(
-            SCRAPER_API_URL,
-            params=payload,
-            timeout=60              # ScraperAPI needs more time than direct requests
-        )
+        resp = requests.get(SCRAPER_API_URL, params=payload, timeout=90)
         if resp.status_code == 200:
-            log.info("Page fetched successfully via ScraperAPI.")
+            log.info(f"Page fetched via ScraperAPI (render={render}).")
             return resp.text
         else:
             log.error(f"ScraperAPI returned status {resp.status_code}")
@@ -150,153 +131,166 @@ def fetch_page(url):
 
 
 def extract_price(soup):
-    """Try multiple known Flipkart price CSS classes."""
-    selectors = ["._30jeq3", ".Nx9bqj", "._16Jk6d", "._1vC4OE"]
+    # Strategy 1: Known CSS selectors
+    selectors = [
+        "._30jeq3", ".Nx9bqj", "._16Jk6d", "._1vC4OE",
+        ".CEmiEU", "._25b18c", ".CxhGGd", "._3qQ9m1",
+    ]
     for sel in selectors:
         el = soup.select_one(sel)
         if el:
-            raw = el.get_text(strip=True).replace("₹", "").replace(",", "").strip()
+            raw = el.get_text(strip=True).replace("\u20b9", "").replace(",", "").strip()
             try:
                 price = int(float(raw))
-                # Sanity check — guard against scraping glitches
                 if PRICE_MIN <= price <= PRICE_MAX:
+                    log.info(f"Price found via CSS selector: {sel}")
                     return price
-                else:
-                    log.warning(f"Price {price} outside sanity bounds ({PRICE_MIN}–{PRICE_MAX}). Ignoring.")
             except ValueError:
                 continue
-    log.warning("Could not find price on page.")
+
+    # Strategy 2: Rupee symbol search
+    for el in soup.find_all(string=re.compile(r'\u20b9\s*[\d,]{4,7}')):
+        match = re.search(r'\u20b9\s*([\d,]+)', str(el))
+        if match:
+            try:
+                price = int(match.group(1).replace(",", ""))
+                if PRICE_MIN <= price <= PRICE_MAX:
+                    log.info("Price found via rupee symbol search.")
+                    return price
+            except ValueError:
+                continue
+
+    # Strategy 3: JSON-LD structured data
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string)
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                offers = item.get("offers", {})
+                if isinstance(offers, list):
+                    offers = offers[0] if offers else {}
+                price_raw = offers.get("price") or item.get("price")
+                if price_raw:
+                    price = int(float(str(price_raw).replace(",", "")))
+                    if PRICE_MIN <= price <= PRICE_MAX:
+                        log.info("Price found via JSON-LD.")
+                        return price
+        except Exception:
+            continue
+
+    # Strategy 4: Meta tags
+    for meta in soup.find_all("meta"):
+        content = meta.get("content", "").strip()
+        prop = (meta.get("property", "") or meta.get("name", "")).lower()
+        if "price" in prop and re.fullmatch(r'\d{4,7}', content):
+            try:
+                price = int(content)
+                if PRICE_MIN <= price <= PRICE_MAX:
+                    log.info("Price found via meta tag.")
+                    return price
+            except ValueError:
+                continue
+
+    log.warning("Could not find price with any strategy.")
     return None
 
 
 def extract_offers(soup):
-    """
-    Extract all instant bank/card offers from Flipkart page.
-    Returns list of dicts: [{bank, discount_amount, raw_text}, ...]
-    Only flat instant discounts (not EMI, not percentage-only).
-    """
     offers = []
-    seen = set()
+    seen_pairs = set()
 
-    # Multiple containers Flipkart uses for offers
+    bank_pattern = re.compile(
+        r'(HDFC|SBI|ICICI|Axis|Kotak|RBL|IDFC|IndusInd|Yes Bank|'
+        r'Citi|HSBC|Amex|American Express|BOB|Bank of Baroda)',
+        re.IGNORECASE
+    )
+
     offer_containers = soup.select(
         "._2Tpdn3, .offer-wrap, ._3xFOBe, ._2AkmmA, .TVhoEJ, "
-        "li._7eSDEz, ._1LKTO3, .offer-item, ._3HMbXn"
+        "li._7eSDEz, ._1LKTO3, .offer-item, ._3HMbXn, "
+        "._2xRNHi, .fMghEO, ._2LHPH5"
     )
-
-    # Also grab any text blocks that mention bank offers
-    all_text_blocks = soup.find_all(
-        string=re.compile(
-            r'(HDFC|SBI|ICICI|Axis|Kotak|RBL|IDFC|IndusInd|Yes Bank|Citi|HSBC|'
-            r'American Express|Amex|BOB|Bank of Baroda)',
-            re.IGNORECASE
-        )
-    )
-
+    all_text_blocks = soup.find_all(string=bank_pattern)
     raw_texts = [el.get_text(" ", strip=True) for el in offer_containers]
     raw_texts += [str(t) for t in all_text_blocks]
 
+    seen_texts = set()
     for text in raw_texts:
-        if not text or text in seen:
+        if not text or text in seen_texts:
             continue
-        seen.add(text)
+        seen_texts.add(text)
 
-        # Skip EMI-only offers
         if re.search(r'\bEMI\b', text, re.IGNORECASE) and \
-           not re.search(r'instant|cashback|off\b', text, re.IGNORECASE):
+           not re.search(r'instant|cashback|\boff\b', text, re.IGNORECASE):
             continue
 
-        # Match flat rupee discounts: "₹10,000 off", "Rs.5000 off", "10000 off"
         match = re.search(
-            r'(?:₹|Rs\.?)\s*([\d,]+)\s*(?:off|instant|discount)',
+            r'(?:\u20b9|Rs\.?)\s*([\d,]+)\s*(?:off|instant|discount)',
             text, re.IGNORECASE
         )
         if not match:
-            # Try reverse: "instant discount of ₹5000"
             match = re.search(
-                r'instant.*?(?:₹|Rs\.?)\s*([\d,]+)',
+                r'instant.*?(?:\u20b9|Rs\.?)\s*([\d,]+)',
                 text, re.IGNORECASE
             )
+        if not match:
+            continue
 
-        if match:
-            amount_str = match.group(1).replace(",", "")
-            try:
-                amount = int(amount_str)
-            except ValueError:
-                continue
+        try:
+            amount = int(match.group(1).replace(",", ""))
+        except ValueError:
+            continue
 
-            # Only care about meaningful discounts (≥ 500)
-            if amount < 500:
-                continue
+        if amount < 500:
+            continue
 
-            # Detect bank name
-            bank_match = re.search(
-                r'(HDFC|SBI|ICICI|Axis|Kotak|RBL|IDFC|IndusInd|Yes Bank|'
-                r'Citi|HSBC|Amex|American Express|BOB|Bank of Baroda)',
-                text, re.IGNORECASE
-            )
-            bank = bank_match.group(1).upper() if bank_match else "Bank"
+        bank_match = re.search(bank_pattern, text)
+        bank = bank_match.group(1).upper() if bank_match else "Bank"
+        card_type = "Card"
+        if re.search(r'credit', text, re.IGNORECASE):
+            card_type = "Credit Card"
+        elif re.search(r'debit', text, re.IGNORECASE):
+            card_type = "Debit Card"
 
-            # Detect card type
-            card_type = "Card"
-            if re.search(r'credit', text, re.IGNORECASE):
-                card_type = "Credit Card"
-            elif re.search(r'debit', text, re.IGNORECASE):
-                card_type = "Debit Card"
-
-            offers.append({
-                "bank": bank,
-                "card_type": card_type,
-                "discount": amount,
-                "raw": text[:120]
-            })
-
-    # Deduplicate by (bank, discount)
-    seen_pairs = set()
-    unique_offers = []
-    for o in offers:
-        key = (o["bank"], o["discount"])
+        key = (bank, amount)
         if key not in seen_pairs:
             seen_pairs.add(key)
-            unique_offers.append(o)
+            offers.append({"bank": bank, "card_type": card_type, "discount": amount})
 
-    return sorted(unique_offers, key=lambda x: x["discount"], reverse=True)
+    return sorted(offers, key=lambda x: x["discount"], reverse=True)
 
 
 # ─────────────────────────────────────────────
 # TELEGRAM
 # ─────────────────────────────────────────────
-def send_telegram(message):
-    # SECURITY: Never log or f-string the full URL — token would appear in
-    # GitHub Actions logs. Build URL silently and never print it.
+def send_telegram(message, retries=3):
     tg_url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
-        "disable_notification": False,  # Force notification even if chat is muted
+        "disable_notification": False,
     }
-    try:
-        r = requests.post(tg_url, json=payload, timeout=15)
-        r.raise_for_status()
-        log.info("Telegram message sent successfully.")
-        return True
-    except requests.exceptions.HTTPError as e:
-        # Log status code only — never log the URL (contains token)
-        log.error(f"Telegram HTTP error: status {e.response.status_code}")
-        return False
-    except Exception as e:
-        # Log exception type only — not full repr which may include URL
-        log.error(f"Telegram send failed: {type(e).__name__}")
-        return False
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.post(tg_url, json=payload, timeout=15)
+            r.raise_for_status()
+            log.info("Telegram message sent.")
+            return True
+        except requests.exceptions.HTTPError as e:
+            log.error(f"Telegram HTTP error (attempt {attempt}): {e.response.status_code}")
+        except Exception as e:
+            log.error(f"Telegram error (attempt {attempt}): {type(e).__name__}")
+        if attempt < retries:
+            time.sleep(5)
+    return False
 
 
 def build_scenario1_message(price, offers, is_reminder=False):
     tag = "🔔 <b>REMINDER</b>" if is_reminder else "🚨 <b>PRICE DROP ALERT</b>"
     lines = [
-        tag,
-        "",
+        tag, "",
         "🎮 <b>PS5 Slim 1024GB</b>",
         f"📉 Listed Price: <b>₹{price:,}</b>",
         f"🎯 Your Target: ₹{TARGET:,}",
@@ -307,14 +301,11 @@ def build_scenario1_message(price, offers, is_reminder=False):
         lines.append("💳 <b>Active Card Offers:</b>")
         for o in offers:
             lines.append(f"  • {o['bank']} {o['card_type']}: ₹{o['discount']:,} off")
-        best = offers[0]["discount"]
-        effective = price - best
-        lines.append("")
-        lines.append(f"🏷️ Best Effective Price: <b>₹{effective:,}</b>")
+        lines += ["", f"🏷️ Best Effective Price: <b>₹{price - offers[0]['discount']:,}</b>"]
     lines += [
         "",
         f"🔗 <a href='{PRODUCT_URL}'>Buy on Flipkart</a>",
-        f"⏰ Checked at: {datetime.now().strftime('%d %b %Y, %I:%M %p')}",
+        f"⏰ {datetime.now().strftime('%d %b %Y, %I:%M %p')}",
     ]
     return "\n".join(lines)
 
@@ -322,19 +313,14 @@ def build_scenario1_message(price, offers, is_reminder=False):
 def build_scenario2_message(price, offers, best_offer, effective_price, is_reminder=False):
     tag = "🔔 <b>REMINDER</b>" if is_reminder else "💳 <b>CARD OFFER ALERT</b>"
     lines = [
-        tag,
-        "",
+        tag, "",
         "🎮 <b>PS5 Slim 1024GB</b>",
         f"🏷️ Listed Price: ₹{price:,}",
         "",
         "💳 <b>All Active Card Offers:</b>",
     ]
     for o in offers:
-        eff = price - o["discount"]
-        lines.append(
-            f"  • {o['bank']} {o['card_type']}: ₹{o['discount']:,} off "
-            f"→ Effective ₹{eff:,}"
-        )
+        lines.append(f"  • {o['bank']} {o['card_type']}: ₹{o['discount']:,} off → Effective ₹{price - o['discount']:,}")
     lines += [
         "",
         f"🏆 Best Deal: <b>{best_offer['bank']} {best_offer['card_type']}</b>",
@@ -343,39 +329,40 @@ def build_scenario2_message(price, offers, best_offer, effective_price, is_remin
         f"💰 Under target by: ₹{TARGET - effective_price:,}",
         "",
         f"🔗 <a href='{PRODUCT_URL}'>Buy on Flipkart</a>",
-        f"⏰ Checked at: {datetime.now().strftime('%d %b %Y, %I:%M %p')}",
+        f"⏰ {datetime.now().strftime('%d %b %Y, %I:%M %p')}",
     ]
     return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────
-# ALERT LOGIC WITH STATE
+# ALERT LOGIC
 # ─────────────────────────────────────────────
 def should_alert(scenario_state, is_triggered):
-    """
-    Returns: "first", "reminder", or None
-    - "first"    → first alert, trigger just fired
-    - "reminder" → second alert, 30 mins after first
-    - None       → no alert (already done, or not triggered)
-    """
-    count = scenario_state["count"]
+    count   = scenario_state["count"]
     last_ts = scenario_state["last_alert_ts"]
-    now_ts = datetime.now(timezone.utc).timestamp()
+    now_ts  = datetime.now(timezone.utc).timestamp()
 
     if not is_triggered:
         return None
     if count == 0:
         return "first"
     if count == 1 and last_ts:
-        mins_elapsed = (now_ts - last_ts) / 60
-        if mins_elapsed >= REMINDER_MINUTES:
+        if (now_ts - last_ts) / 60 >= REMINDER_MINUTES:
             return "reminder"
-    return None  # Already sent both alerts
+    return None
 
 
-def update_scenario_state(scenario_state):
-    scenario_state["count"] += 1
-    scenario_state["last_alert_ts"] = datetime.now(timezone.utc).timestamp()
+def update_scenario_state(s):
+    s["count"] += 1
+    s["last_alert_ts"] = datetime.now(timezone.utc).timestamp()
+
+
+def reset_scenario(state, key):
+    if state[key]["count"] > 0:
+        log.info(f"{key} recovered — resetting state.")
+        state[key] = {"count": 0, "last_alert_ts": None}
+        return True
+    return False
 
 
 # ─────────────────────────────────────────────
@@ -386,19 +373,23 @@ def main():
     validate_config()
     state = load_state()
 
-    html = fetch_page(PRODUCT_URL)
-    if not html:
-        log.error("Could not fetch Flipkart page. Exiting.")
-        return
+    # Attempt 1: static HTML (1 credit)
+    html  = fetch_page(PRODUCT_URL, render=False)
+    soup  = BeautifulSoup(html, "lxml") if html else None
+    price = extract_price(soup) if soup else None
 
-    soup = BeautifulSoup(html, "html.parser")
-    price = extract_price(soup)
-    offers = extract_offers(soup)
+    # Attempt 2: JS-rendered fallback (5 credits)
+    if price is None:
+        log.info("Retrying with JS rendering...")
+        html  = fetch_page(PRODUCT_URL, render=True)
+        soup  = BeautifulSoup(html, "lxml") if html else None
+        price = extract_price(soup) if soup else None
 
     if price is None:
-        log.warning("Price not found. Flipkart may be blocking. Skipping this run.")
+        log.warning("Price not found after both attempts. Skipping.")
         return
 
+    offers = extract_offers(soup)
     log.info(f"Listed price: ₹{price:,}")
     log.info(f"Offers found: {len(offers)}")
     for o in offers:
@@ -406,57 +397,49 @@ def main():
 
     state_changed = False
 
-    # ── SCENARIO 1: Listed price dropped below target ──
+    # ── SCENARIO 1 ──
     s1_triggered = price < TARGET
-    s1_action = should_alert(state["scenario1"], s1_triggered)
+    s1_action    = should_alert(state["scenario1"], s1_triggered)
 
     if s1_action:
-        is_reminder = s1_action == "reminder"
-        msg = build_scenario1_message(price, offers, is_reminder=is_reminder)
+        msg = build_scenario1_message(price, offers, is_reminder=(s1_action == "reminder"))
         if send_telegram(msg):
             update_scenario_state(state["scenario1"])
             state_changed = True
             log.info(f"Scenario 1 alert sent ({s1_action}).")
     elif s1_triggered:
-        log.info("Scenario 1 triggered but max alerts already sent.")
+        log.info("Scenario 1: max alerts already sent.")
     else:
-        log.info(f"Scenario 1: listed price ₹{price:,} is above target ₹{TARGET:,}.")
-        # Reset state if price goes back above target (so future drops re-trigger)
-        if state["scenario1"]["count"] > 0:
-            log.info("Price recovered above target — resetting Scenario 1 state.")
-            state["scenario1"] = {"count": 0, "last_alert_ts": None}
+        log.info(f"Scenario 1: ₹{price:,} above target ₹{TARGET:,}.")
+        if reset_scenario(state, "scenario1"):
             state_changed = True
 
-    # ── SCENARIO 2: Effective price (after offers) dropped below target ──
-    best_offer = None
+    # ── SCENARIO 2 ──
+    best_offer      = None
     effective_price = None
-    s2_triggered = False
+    s2_triggered    = False
 
     if offers and price >= TARGET:
-        # Only evaluate offers if listed price hasn't already triggered Scenario 1
-        best_offer = offers[0]
+        best_offer      = offers[0]
         effective_price = price - best_offer["discount"]
-        s2_triggered = effective_price < TARGET
-        log.info(f"Scenario 2: effective price ₹{effective_price:,} (₹{price:,} - ₹{best_offer['discount']:,})")
+        s2_triggered    = effective_price < TARGET
+        log.info(f"Scenario 2: effective ₹{effective_price:,}")
 
     s2_action = should_alert(state["scenario2"], s2_triggered)
 
     if s2_action:
-        is_reminder = s2_action == "reminder"
         msg = build_scenario2_message(
-            price, offers, best_offer, effective_price, is_reminder=is_reminder
+            price, offers, best_offer, effective_price,
+            is_reminder=(s2_action == "reminder")
         )
         if send_telegram(msg):
             update_scenario_state(state["scenario2"])
             state_changed = True
             log.info(f"Scenario 2 alert sent ({s2_action}).")
     elif s2_triggered:
-        log.info("Scenario 2 triggered but max alerts already sent.")
+        log.info("Scenario 2: max alerts already sent.")
     else:
-        # Reset if offers disappear or effective price goes back above target
-        if state["scenario2"]["count"] > 0:
-            log.info("Effective price recovered — resetting Scenario 2 state.")
-            state["scenario2"] = {"count": 0, "last_alert_ts": None}
+        if reset_scenario(state, "scenario2"):
             state_changed = True
 
     if state_changed:
