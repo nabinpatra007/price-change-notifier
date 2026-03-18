@@ -1,4 +1,10 @@
 {
-  "scenario1": {"count": 0, "last_alert_ts": null},
-  "scenario2": {"count": 0, "last_alert_ts": null}
+  "scenario1": {
+    "count": 1,
+    "last_alert_ts": 1773792188.251232
+  },
+  "scenario2": {
+    "count": 0,
+    "last_alert_ts": null
+  }
 }
