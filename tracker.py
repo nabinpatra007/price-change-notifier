@@ -5,7 +5,7 @@ Two scenarios:
 
 1. Listed price drops below TARGET
 1. Effective price (after instant card offers) drops below TARGET
-   “””
+“””
 
 import os
 import sys
