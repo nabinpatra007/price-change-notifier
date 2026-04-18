@@ -4,7 +4,7 @@
     "last_alert_ts": null
   },
   "scenario2": {
-    "count": 2,
-    "last_alert_ts": 1775233382.292312
+    "count": 0,
+    "last_alert_ts": null
   }
 }
